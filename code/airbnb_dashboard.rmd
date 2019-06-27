@@ -1,0 +1,1070 @@
+#
+# This is a Shiny web application. You can run the application by clicking
+# the 'Run App' button above.
+#
+# Find out more about building applications with Shiny here:
+#
+#    http://shiny.rstudio.com/
+#
+
+```{r}
+library(shiny)
+library(shinythemes)
+
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(data.table)
+library(DT)
+library(ggplot2)
+library(corrplot)
+library(qgraph)
+
+library(qdap)
+library(tm)
+library(wordcloud)
+library(tidytext)
+library(Matrix)
+library(RColorBrewer)
+
+library(recommenderlab)
+library(qgraph)
+library(corrplot)
+library(Matrix)
+```
+
+```{r}
+# Loading London Airbnb datasets into R
+# Loading the listings file
+filenames = list.files("data/listings", "*.csv.gz", full.names = TRUE)
+listings <- rbindlist(lapply(filenames, read_csv))
+
+
+# Loading the Calendar file
+filenames = list.files("data/calendars", "*.csv.gz", full.names = TRUE)
+calendar <- rbindlist(lapply(filenames, read_csv))
+
+# Loading the Reviews file
+filenames = list.files("data/reviews", "*.csv.gz", full.names = TRUE)
+reviews <- rbindlist(lapply(filenames, read_csv))
+
+# Loading the neighbourhoods file
+#neighbourneighbourhoods = read_csv("data/neighbourhoods/neighbourhoods.csv")
+
+
+# Data cleaning
+# Removing undesirable columns in the Listings file
+listings <- listings %>%
+  select(
+    -scrape_id,
+    -last_scraped,
+    -experiences_offered,
+    -notes,
+    -transit,
+    -access,
+    -interaction,
+    -house_rules,
+    -medium_url,
+    -picture_url,
+    -xl_picture_url,
+    -host_url,
+    -host_name,-host_location,
+    -host_about,
+    -host_acceptance_rate,
+    -host_thumbnail_url,
+    -host_picture_url,
+    -host_neighbourhood,-host_listings_count,
+    -host_total_listings_count,
+    -host_verifications,
+    -host_has_profile_pic,
+    -host_identity_verified,-street,
+    -neighbourhood,
+    -neighbourhood_group_cleansed,
+    -state,
+    -zipcode,
+    -market,
+    -country_code,
+    -country,-calendar_last_scraped,
+    -requires_license,
+    -license,
+    -jurisdiction_names,
+    -require_guest_profile_picture,-require_guest_phone_verification,
+    -calculated_host_listings_count
+  ) %>%
+  select(
+    -space,
+    -host_id,
+    -host_since,
+    -bed_type,
+    -square_feet,
+    -weekly_price,
+    -monthly_price,
+    -security_deposit,
+    -cleaning_fee,
+    -has_availability
+  ) %>%
+  select(
+    -neighborhood_overview,
+    -city,
+    -smart_location,
+    -is_location_exact,
+    -calendar_updated,
+    -availability_30,
+    -availability_60,
+    -availability_90,
+    -first_review,
+    -last_review
+  )
+
+
+# Remove rows with missing values in Listings file
+listings = na.omit(listings)
+
+## Done, we have clean Listings data!
+
+# Cleaning Calendar data
+# Only keep dates where the listing is available
+calendar <- calendar %>% filter(available == 't') %>%
+  select(-available) %>%
+  # Create variable for month
+  mutate(dateFormatted = as.Date(date, "%Y-%m-%d")) %>%
+  mutate(month = months(dateFormatted, abbreviate = TRUE)) %>%
+  # Remove date and dateFormatted variables
+  select(-date,-dateFormatted) %>%
+  # Remove duplicate rows
+  distinct(listing_id, month, .keep_all = TRUE)
+
+
+# replace $ with blank "" in the calendar$price column, then convert to numeric
+calendar <- calendar %>%
+  mutate(id = listing_id, price = as.numeric(gsub("[$,]", "", price))) %>%
+  # Remove missing values brought about by the change to numeric data type
+  na.omit()
+
+listings <- listings %>%
+  mutate(price = as.numeric(gsub('[$,]', '', price)))
+
+# Done, we have clean calendar data showing Available Month and Price for each listing!
+
+#join of calendar with 
+listingCalendar <- listings %>%
+  inner_join(calendar, by = "id")
+
+# Data preparation for making wordcloud
+sandbox <-
+  listingCalendar %>% select(property_type, room_type, description, price.x)
+sandbox <- data_frame(
+  line = 1:nrow(sandbox),
+  property_type = sandbox$property_type,
+  room_type = sandbox$room_type,
+  description = sandbox$description,
+  price = sandbox$price.x
+)
+
+tokenizedsandbox <- sandbox %>%
+  unnest_tokens(word, description)
+
+data(stop_words)
+
+numbers <-
+  data.frame(word = as.character(0:20),
+             lexicon = "SMART",
+             stringsAsFactors = FALSE)
+
+tidy_tokenized <- tokenizedsandbox %>%
+  anti_join(stop_words) %>% anti_join(numbers)
+
+###### Data Preparation for Sentiment Analysis
+listingReviews2 <- listings %>% inner_join(reviews, by = c("id" = "listing_id")) %>%
+  select(id, reviewer_id, comments)
+
+
+################### Data preparation for Recommender
+#listingReviews <- listings %>%  inner_join(reviews, by = c("id" = "listing_id"))
+listingReviews <- listings %>% inner_join(reviews, by = c("id" = "listing_id")) %>%
+  select(id, reviewer_id, review_scores_rating)
+
+
+dfmat <- listingReviews %>% 
+  select(id, reviewer_id, review_scores_rating) %>%
+  group_by(id, reviewer_id) %>%
+  summarise(meanScore = mean(review_scores_rating)) %>%
+  sort(id, decreasing = FALSE)
+
+temp <- dfmat %>%
+  group_by(reviewer_id) %>%
+  summarise(count = n()) %>%
+  filter(count > 3)
+
+dfmat <- dfmat %>% inner_join(temp, by = "reviewer_id") %>% select(-count)
+
+dimension_names <- list(reviewer_id = sort(unique(dfmat$reviewer_id)), 
+                        listing_id = sort(unique(dfmat$id)))
+
+dfmat <- dfmat %>%
+  spread(id, meanScore) 
+
+ratingmat <- as.matrix(dfmat[2:ncol(dfmat)])
+
+dimnames(ratingmat) <- dimension_names
+
+
+# Data preparation for Multivariate
+listings_Multivariate = listings %>% 
+  select(price, review_scores_rating, number_of_reviews, reviews_per_month, accommodates, bathrooms, bedrooms, beds)
+```
+
+# Define UI for application that draws a histogram
+```{r}
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  
+  # Application title
+  navbarPage(
+    title = "ISSS616 Airbnb",
+    
+    tabPanel("Dashboard",
+             
+             navbarPage(title = "",
+                        
+                        tabPanel("Top 10 Listings",
+                                 fluidRow(
+                                   column(1),
+                                   column(10,
+                                          dataTableOutput("toplistingtable")),
+                                   column(1)
+                                   
+                                 )), 
+                        
+                        tabPanel("Overall View of Property",
+                                 fluidRow(
+                                   column(1),
+                                   column(5,
+                                          plotOutput("ptypebar")
+                                   ),
+                                   column(5,
+                                          plotOutput("rtypebar")),
+                                   column(1)
+                                 )
+                        ),
+                        
+                        tabPanel("Inferential Statistics", 
+                                 fluidRow(
+                                   column(1),
+                                   column(5,
+                                         plotOutput("priceAndReviewRating")
+                                   ),
+                                   column(5,
+                                          plotOutput("priceAndReviewNo")),
+                                   column(1)
+                                 ),
+                                 
+                                 fluidRow(
+                                   column(1),
+                                   column(5,
+                                         plotOutput("priceAndMonthlyReviewNo")
+                                   ),
+                                   column(5,
+                                          plotOutput("priceAndGuestNo")),
+                                   column(1)
+                                 ),
+                                 
+                                  fluidRow(
+                                   column(1),
+                                   column(5,
+                                         plotOutput("priceAndBathroom")
+                                   ),
+                                   column(5,
+                                          plotOutput("priceAndBedroom")),
+                                   column(1)
+                                 ),
+                                 
+                                 fluidRow(
+                                   column(4),
+                                   column(4,
+                                         plotOutput("priceAndNoOfBeds")
+                                   ),
+                                   column(4)
+                                 )
+                          
+                                 
+                                 ),
+                        
+                        tabPanel("Regression",
+                                 fluidRow(
+                                   column(2),
+                                   column(8,
+                                          verbatimTextOutput("priceRegression")),
+                                   column(2)
+                                 
+                                 )
+                        )
+             )
+    ),
+    
+    ################## 2nd Tab @@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    tabPanel(
+      "Plan your Staycation Here!",
+      
+      fluidRow(
+        column(4),
+        column(
+          6,
+          selectInput(
+            inputId = "propertyType",
+            label = "property Type",
+            choices = c(
+              unique(listingCalendar$property_type),
+              "All" = "All"
+            ),
+            selected = "Apartment"
+          ),
+          
+          selectInput(
+            inputId = "roomType",
+            label = "room Type",
+            choices = c(
+              unique(listingCalendar$room_type),
+              "All" = "All"
+            ),
+            selected = "Apartment"
+          ),
+          
+          textOutput("sliderText"),
+          
+          sliderInput(
+            inputId = "propertyPrice",
+            label = "",
+            min = 0,
+            max = 1000,
+            value = c(100, 200)
+          )
+        ),
+        column(2)
+      ),
+      
+      navbarPage(
+        title = "",
+        
+        tabPanel(
+          "Price Dynamics",
+          fluidRow(column(6, tags$p(
+            "When is the best time to stay?"
+          )),
+          column(6,
+                 tags$p(
+                   "How is the availability?"
+                 ))),
+          
+          fluidRow(column(6, plotOutput("priceOverMonth")),
+                   column(6,
+                          plotOutput("availOverMonth")))
+        ),
+        
+        tabPanel("Neighbourhood",
+                 fluidRow(
+                   column(1),
+                   column(5,
+                          plotOutput("availNeighbor")),
+                   column(5,
+                          plotOutput("priceNeighbor")),
+                   column(1)
+                 )),
+        tabPanel("What do owners mostly write?",
+                 fluidRow(
+                   column(6,
+                          plotOutput("wordcloud")),
+                   column(6,
+                          plotOutput("wordPlot"))
+                 )),
+        tabPanel("Scores",
+                 fluidRow(
+                   column(6,
+                          plotOutput("reviewRating")),
+                   column(6,
+                          plotOutput("accuracyRating"))
+                 ),
+                 
+                 fluidRow(
+                   column(6,
+                          plotOutput("cleanlinessRating")),
+                   column(6,
+                          plotOutput("checkinRating"))
+                 ),
+                 
+                 
+                 fluidRow(
+                   column(6,
+                          plotOutput("communicationRating")),
+                   column(6,
+                          plotOutput("locationRating"))
+                 )
+                 
+                 
+        )
+      )
+    ),
+    
+    ##################The Recommender#################
+    tabPanel("Need Suggestion?", 
+             
+             fluidRow(
+               column(4),
+               column(6,
+                      textInput(inputId = "reviewerID", label = "Insert Your ID Here"),
+                      fluidRow(
+                        column(3, actionButton(inputId = "proceed", label = "Recommend Me!")),
+                        column(6, textOutput("errorMessage")),
+                        column(3)
+                      )
+               ),
+               column(2)
+             ),
+             tags$br(),
+             navbarPage(
+               title = "",
+               
+               tabPanel("Recommendation",
+                        fluidRow(
+                          column(1),
+                          column(10,
+                                 dataTableOutput("recommenderTable")
+                          ),
+                          column(1)
+                        )
+               ),
+               tabPanel("ConnectionPlot", 
+                        fluidRow(column(2),
+                                 column(8,
+                                 plotOutput("recommenderPlot")),
+                                 column(2))
+               ),
+               
+               tabPanel("Sentiment Analysis",
+                        fluidRow(column(2),
+                                 column(8,
+                                        plotOutput("sentimentOutput")
+                                 ),
+                                 column(2)
+                                 )
+                        )
+                        
+                      
+               )
+    )  
+  ) 
+)
+
+###############################################################################################################
+# Define server logic required to draw a histogram
+server <- function(session, input, output) {
+  observeEvent(input$propertyType, {
+    
+    choice <- listingCalendar
+    if(input$propertyType != "All") {
+      choice <- choice %>%
+        filter(property_type == input$propertyType) 
+    }
+    
+    choice <- choice %>%
+      select(room_type) %>%
+      unique()
+    
+    updateSelectInput(session,
+                      "roomType",
+                      "Room Type",
+                      choices = c(choice$room_type, "All" = "All"))
+    
+  })
+  
+  
+  observeEvent(input$roomType, {
+    lprices <- listingCalendar
+    if(input$propertyType != "All") {
+      lprices <- lprices %>%
+        filter(property_type == input$propertyType)
+    }
+    
+    
+    if(input$roomType != "All") {
+      lprices <- lprices %>%
+        filter(room_type == input$roomType)
+    }
+    
+    lprices <- lprices %>%
+      select(price.y)
+    
+    maxPrice <- max(lprices)
+    
+    minPrice <- min(lprices)
+    
+    updateSliderInput(
+      session,
+      "propertyPrice",
+      value = c(maxPrice / 4, maxPrice * 3 / 4),
+      min = minPrice,
+      max = maxPrice,
+      step = 1
+    )
+  })
+  
+  # Text Displays
+  output$sliderText <- renderText({
+    paste("Price >= $",
+          input$propertyPrice[1],
+          " & <= $",
+          input$propertyPrice[2])
+  })
+  output$errorMessage <- renderText({
+    message$data
+  })
+  
+  #Reactive Values
+  getlistingCalendar <- reactive({
+    temp <- listingCalendar %>%
+      filter((price.y >= input$propertyPrice[1]) &
+               (price.y <= input$propertyPrice[2])
+      )
+    
+    if(input$propertyType != "All") {
+      temp <- temp %>%
+        filter(property_type == input$propertyType)
+    }
+    
+    if(input$roomType != "All") {
+      temp <- temp %>%
+        filter(room_type == input$roomType)
+    }
+    
+    temp
+    
+  })
+  
+  getlisting <- reactive({
+    temp2 <- listings %>%
+      filter((price >= input$propertyPrice[1]) &
+               (price <= input$propertyPrice[2])
+      )
+    
+    if(input$propertyType != "All") {
+      temp2 <- temp2 %>%
+        filter(property_type == input$propertyType)
+    }
+    
+    if(input$roomType != "All") {
+      temp2 <- temp2 %>%
+        filter(room_type == input$roomType)
+    }
+    
+    temp2
+    
+  })
+  
+  getTokens <- reactive({
+    temp3 <- tidy_tokenized %>%
+      filter((price >= input$propertyPrice[1]) &
+               (price <= input$propertyPrice[2])
+      )
+    
+    if(input$propertyType != "All") {
+      temp3 <- temp3 %>%
+        filter(property_type == input$propertyType)
+    }
+    
+    if(input$roomType != "All") {
+      temp3 <- temp3 %>%
+        filter(room_type == input$roomType)
+    }
+    
+    temp3
+  })
+  
+  ########################################################################
+  
+  # inferential statistics
+  
+  output$priceAndReviewRating <- renderPlot ({
+     plot(listings_Multivariate$review_scores_rating, listings_Multivariate$price)
+  abline(lm(listings_Multivariate$price~listings_Multivariate$review_scores_rating), col="red") 
+  })
+  
+  output$priceAndReviewNo <- renderPlot ({
+    plot(listings_Multivariate$number_of_reviews, listings_Multivariate$price)
+    abline(lm(listings_Multivariate$price~listings_Multivariate$number_of_reviews), col="red")
+  })
+  
+  output$priceAndMonthlyReviewNo <- renderPlot ({
+    plot(listings_Multivariate$reviews_per_month, listings_Multivariate$price)
+    abline(lm(listings_Multivariate$price~listings_Multivariate$reviews_per_month), col="red")
+  })
+ 
+  output$priceAndGuestNo <- renderPlot ({
+    plot(listings_Multivariate$accommodates, listings_Multivariate$price)
+    abline(lm(listings_Multivariate$price~listings_Multivariate$accommodates), col="red")
+  })
+  
+  output$priceAndBathroom <- renderPlot ({
+    plot(listings_Multivariate$bathrooms, listings_Multivariate$price)
+  abline(lm(listings_Multivariate$price~listings_Multivariate$bathrooms), col="red")
+  })
+  
+  output$priceAndBedroom <- renderPlot ({
+    plot(listings_Multivariate$bedrooms, listings_Multivariate$price)
+  abline(lm(listings_Multivariate$price~listings_Multivariate$bedrooms), col="red")
+
+  })
+  
+  output$priceAndNoOfBeds <- renderPlot ({
+    plot(listings_Multivariate$beds, listings_Multivariate$price)
+abline(lm(listings_Multivariate$price~listings_Multivariate$beds), col="red")
+
+  })
+  
+  output$priceRegression <- renderPrint ({
+    fit = lm(price~accommodates+bathrooms+bedrooms+beds, data=listings_Multivariate)
+    summary(fit)
+  })
+
+
+  # static dashboard
+  
+  output$toplistingtable <- renderDataTable({
+    listings %>%
+      arrange(-number_of_reviews) %>%
+      mutate(image = paste0('<img src="', thumbnail_url, '"></img>')) %>% 
+      top_n(10, wt = number_of_reviews) %>%
+      select(id, image, name, neighbourhood_cleansed, room_type, accommodates, price,
+             number_of_reviews, review_scores_rating ) %>%
+      datatable(class = "nowrap hover row-border",escape = FALSE,
+                options = list(
+                  dom = 't',
+                  scrollX = TRUE,
+                  autoWidth = TRUE
+                )
+      )
+  })
+  
+  
+  
+  #What is the distribution of listings by property type?
+  output$ptypebar <- renderPlot ({
+    listings %>% group_by(property_type) %>%
+      summarise(count=n()) %>% 
+      ggplot(aes(x = reorder(property_type, count), y = count)) +
+      geom_bar(stat = "identity", aes(fill = count)) + 
+      theme(text = element_text(size = 15)) +
+      scale_fill_gradient(low = "red",high = "blue") +
+      coord_flip()
+    
+  })
+  
+  
+  # 5. What is the distribution of listings by room type? 
+  
+  output$rtypebar <- renderPlot ({
+    listings %>% group_by(room_type) %>%
+      summarise(count=n()) %>%
+      ggplot(aes(x = reorder(room_type, count), y = count)) +
+      geom_bar(stat = "identity", aes(fill = count)) +
+      theme(text = element_text(size = 15)) +
+      scale_fill_gradient(low = "red", high = "blue")
+  })
+  
+  
+  
+  ######################################################################
+  ######################################################################
+  
+  #dynamic dashboard
+  
+  # Neighbour ###############################################################
+  output$availNeighbor <- renderPlot ({
+    getlisting() %>% group_by(neighbourhood_cleansed) %>%
+      summarise(count = n()) %>%
+      ggplot(aes(
+        x = reorder(neighbourhood_cleansed, count),
+        y = count
+      )) +
+      geom_bar(stat = "identity", aes(fill = count)) +
+      theme(text = element_text(size = 15)) +
+      scale_fill_gradient(low = "blue", high = "red",name="neighbourhood") +
+      labs(x="neighbourhood") +
+      coord_flip()
+  })
+  
+  output$priceNeighbor <- renderPlot ({
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = price, fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+  })
+  
+  # SCORES ############################################################
+  
+  # 8. What is the mean review rating score by neighbourhood? 
+  
+  output$reviewRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_rating, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  
+  # 9. What is the mean review score on accuracy by neighbourhood? 
+  
+  output$accuracyRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_accuracy, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  # 10. What the mean review score on cleanliness by neighbourhood?
+  output$cleanlinessRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_cleanliness, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  # 11. What is the mean review score on checkin by neighbourhood? 
+  output$checkinRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_checkin, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  # 12. What is the mean review score on communication by neighbourhood? 
+  output$communicationRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_communication, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  # 13. What is the mean review score on location by neighbourhood? 
+  output$locationRating <- renderPlot( {
+    getlisting() %>%
+      ggplot(aes(x = neighbourhood_cleansed, y = review_scores_location, 
+                 fill = neighbourhood_cleansed)) +
+      geom_boxplot() +
+      theme(text = element_text(size = 15)) +
+      scale_fill_hue(l=40, c=35) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 1.5
+      ) +
+      xlab("neighbourhood") +
+      coord_flip()
+    
+  })
+  
+  # WORDCLOUD #########################################################
+  wordcloud_rep <- repeatable(wordcloud)
+  
+  output$wordcloud <- renderPlot({
+    tokens <- getTokens()
+    if (nrow(tokens) > 0) {
+      tokens %>%
+        count(room_type, word, sort = TRUE) %>%
+        with(
+          wordcloud_rep(
+            word,
+            n,
+            max.words = 100,
+            scale = c(3.5, 0.1),
+            colors = brewer.pal(8, "Dark2"),
+            random.order = FALSE,
+            rot.per = 0.15
+          )
+        )
+    }
+  })
+  
+  output$wordPlot <- renderPlot({
+    tokens <- getTokens()
+    if (nrow(tokens) > 0) {
+      getTokens() %>%
+        count(room_type, word, sort = TRUE) %>%
+        group_by(room_type) %>%
+        top_n(5) %>%
+        ggplot(aes(x = word, y = n)) +
+        geom_bar(stat = "identity", aes(fill = n)) +
+        theme(text = element_text(size = 15)) +
+        scale_fill_gradient(low = "blue", high = "red") +
+        xlab("Most Spoken Word") +
+        ylab("Frequency") +
+        coord_flip()
+      #+ labs(title = "Word Spoken Frequency over Different Property Type",
+      #  subtitle = "A quick brown fox jumps over a lazy dog",
+      # caption = "(C) mySELF")
+    }
+  })
+  #######################################################################
+  
+  # Price Dynamics #####################################################################
+  output$priceOverMonth <- renderPlot({
+    getlistingCalendar() %>%
+      ggplot(aes(x = month, y = price.y)) +
+      geom_boxplot(aes(fill = month)) +
+      stat_summary(
+        geom = "point",
+        fun.y = "mean",
+        colour = "red",
+        size = 4
+      )
+  })
+  
+  output$availOverMonth <- renderPlot ({
+    getlistingCalendar() %>%
+      group_by(month) %>%
+      summarise(count = n()) %>%
+      ggplot(mapping = aes(
+        x = reorder(month, -count),
+        y = count,
+        fill = month
+      )) +
+      geom_bar(stat = "identity")
+  })
+  ########################################################################
+  
+  #recommender
+  #########################################################################
+  
+  predictions <- reactiveValues(data = data.frame())
+  message <- reactiveValues(data = "")
+  
+  observeEvent (input$proceed, {
+    
+    #current_user <- "6428099"
+    #current_user <- "4974368"
+    message$data = ""
+    if(input$reviewerID %in% dfmat$reviewer_id) {
+      current_user <- input$reviewerID
+      rated_items <-
+        which(!is.na((as.data.frame(ratingmat[current_user,]))))
+      selected_users <-
+        names(which(apply(!is.na(ratingmat[, rated_items]), 1, sum) >= 2))
+      #head(selected_users, 40)
+      
+      rmat <- ratingmat[selected_users, ]
+      user_mean_ratings <- rowMeans(rmat, na.rm = T)
+      rmat <- rmat - user_mean_ratings
+      
+      similarities <-
+        cor(t(rmat[rownames(rmat) != current_user, ]), rmat[current_user, ], use = 'pairwise.complete.obs')
+      sim <- as.vector(similarities)
+      names(sim) <- rownames(similarities)
+      res <- sort(sim, decreasing = TRUE)
+      #head(res, 40)
+      
+      #similaruser
+      similar_users <- names(res[1:2])
+      
+      similar_users_ratings <-
+        data.frame(item = rep(colnames(rmat), length(similar_users)), rating = c(t(as.data.frame(rmat[similar_users,])))) %>% filter(!is.na(rating))
+      
+      current_user_ratings <-
+        data.frame(item = colnames(rmat), rating = rmat[current_user,]) %>% filter(!is.na(rating))
+      
+      predictionTemp <-
+        similar_users_ratings %>%
+        filter(!(item %in% current_user_ratings$item)) %>%
+        group_by(item) %>% summarize(mean_rating = mean(rating))
+      
+       predictions$data <- predictionTemp %>%
+        arrange(-mean_rating) %>%
+        top_n(5, wt = mean_rating) %>%
+        mutate(id = as.numeric(as.character(item))) %>%
+        select(-item) %>%
+        inner_join(listings, by = "id") %>%
+        mutate(image = paste0('<img src="', thumbnail_url, '"></img>'))%>%
+        select(id, image, name, neighbourhood_cleansed, room_type, accommodates, price,
+               number_of_reviews, review_scores_rating )
+    }
+    else
+      message$data = "ID Not Found"
+  })
+  
+  shinyInput <- function(FUN, len, id, ...) {
+      inputs <- character(len)
+      for (i in seq_len(len)) {
+        inputs[i] <- as.character(FUN(paste0(id, i), ...))
+      }
+      inputs
+    }
+  
+  getTop5Recommended <- reactive ({
+    df <- data_frame(
+      id = predictions$data$id,
+      image = predictions$data$image,
+      name = predictions$data$name,
+      neighbourhood_cleansed = predictions$data$neighbourhood_cleansed,
+      room_type = predictions$data$room_type,
+      accommodates = predictions$data$accommodates,
+      price = predictions$data$price,
+      number_of_reviews = predictions$data$number_of_reviews,
+      review_scores_rating = predictions$data$review_scores_rating,
+      
+      Actions = shinyInput(  actionButton, nrow(predictions$data),
+      'button_', label = "Plot Review Sentiment",
+      onclick = 'Shiny.onInputChange(\"select_button\",  this.id)'
+      ),
+      row.names = 1:nrow(predictions$data)
+    )
+    df
+  })
+  
+  
+  output$recommenderTable <- renderDataTable({
+    
+    if(nrow(predictions$data) > 0) {
+      getTop5Recommended() %>%
+      datatable(
+      class = "nowrap hover row-border",
+      escape = FALSE,
+      options = list(
+      dom = 't',
+      scrollX = TRUE,
+      server = FALSE,
+      autoWidth = TRUE
+      )
+      )
+    }
+  })
+  
+  observeEvent(input$select_button, {
+      selectedRow <- as.numeric(strsplit(input$select_button, "_")[[1]][2])
+      selected$id <- getTop5Recommended()[selectedRow,1]
+      
+    })
+  
+  selected <- reactiveValues(id = 0)
+    
+    getPolReviews <- reactive({
+      #data sampling
+      sampreviews <- listingReviews2 %>% filter(id == as.numeric(selected$id))
+      
+      sampreviews <- sampreviews %>%
+      mutate(row = 1:nrow(sampreviews))
+      
+      sampreviews <- data_frame(
+      id = 1:nrow(sampreviews),
+      comments = iconv(sampreviews$comments, to = "UTF-8")
+      )
+      
+      pol_review <- polarity(sampreviews$comments)
+      
+      pol_review$all
+    })
+    
+  output$sentimentOutput <- renderPlot ({
+    polreviewall <- getPolReviews()
+    if(length(polreviewall) > 0) {
+      polreviewall %>%
+      ggplot(aes(x = polarity, y = ..density..)) + 
+  #theme_gdocs() + 
+      geom_histogram(binwidth = 0.25, fill = "#bada55", colour = "grey60") +
+      geom_density(size = 0.75)
+    }
+  })
+  
+  output$recommenderPlot <- renderPlot({
+    if(input$reviewerID %in% dfmat$reviewer_id) {
+      current_user <- input$reviewerID
+      rated_items <-
+        which(!is.na((as.data.frame(ratingmat[current_user,]))))
+      selected_users <-
+        names(which(apply(!is.na(ratingmat[, rated_items]), 1, sum) >= 2))
+      #head(selected_users, 40)
+      
+      rmat <- ratingmat[selected_users, ]
+      user_mean_ratings <- rowMeans(rmat, na.rm = T)
+      rmat <- rmat - user_mean_ratings
+      
+      sim_mat <- cor(t(rmat), use = 'pairwise.complete.obs')
+    random_users <-
+        head(selected_users[selected_users != current_user], 7)
+    
+    qgraph(
+      sim_mat[c(current_user, random_users), c(current_user, random_users)],
+      layout = "spring",
+      vsize = 6.5,
+      theme = "TeamFortress",
+      labels = c(current_user, random_users)
+    )
+    }
+  })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
+```
