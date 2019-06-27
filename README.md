@@ -1,4 +1,4 @@
-# AirBnB-Recommendation-Dashboard
+# Airbnb-Recommendation-Dashboard
 This repository contains the code and methodology for building a recommendation app to recommend listings to users based on experiences of other similar users.
 
 # 1.0 Introduction
